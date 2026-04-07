@@ -404,7 +404,7 @@ void SpatialRenderer::drawAndPresent(cp_frame_t frame, cp_drawable_t drawable) {
                                               (float)_configuration.panelOffsetY,
                                               (float)_configuration.panelOffsetZ,
                                               1.0f);
-    _disparityStrength = std::clamp((float)_configuration.disparityStrength, 0.0f, 13.0f);
+    _disparityStrength = std::clamp((float)_configuration.disparityStrength, 0.0f, 50.0f);
     float panelScale = std::max(0.2f, (float)_configuration.panelScale);
     
     simd_float4x4 panelScaleMatrix = matrix_scale(panelScale, panelScale, 1.0f);
@@ -416,8 +416,10 @@ void SpatialRenderer::drawAndPresent(cp_frame_t frame, cp_drawable_t drawable) {
     updateVideoFrame();
 
     // If AI depth is missing or lagging behind the current video frame, generate a fallback depth map from luma.
-    double depthLatency = _latestDepthTimestamp - _lastDepthTimestamp;
+    double depthLatency = std::max(0.0, _latestDepthTimestamp - _lastDepthTimestamp);
     bool depthStale = (_hasDepthModel && depthLatency > 0.12);
+    // Damp disparity when depth is slightly behind video to reduce pan-time shimmer artifacts.
+    float disparityStabilityScale = 1.0f - std::clamp((float)((depthLatency - 0.016) / 0.12), 0.0f, 0.45f);
     if (!_hasDepthModel || depthStale) {
         id<MTLCommandBuffer> fallbackCommandBuffer = [_commandQueue commandBuffer];
         updateFallbackDepthFromLuma(fallbackCommandBuffer);
@@ -453,11 +455,14 @@ void SpatialRenderer::drawAndPresent(cp_frame_t frame, cp_drawable_t drawable) {
             [renderCommandEncoder setRenderPipelineState:_contentRenderPipelineState];
             // Separation converts a user-facing strength value into texture-space eye offset.
             float separation = _disparityStrength / std::max(1.0f, (float)_videoQuadMesh->texture().width);
+            separation *= disparityStabilityScale;
             uint32_t eyeOverride = static_cast<uint32_t>(i);
             float colorBoost = std::clamp((float)_configuration.colorBoost, 0.80f, 1.40f);
+            float stabilityAmount = std::clamp((float)_configuration.stabilityAmount, 0.0f, 1.0f);
             [renderCommandEncoder setFragmentBytes:&separation length:sizeof(separation) atIndex:0];
             [renderCommandEncoder setFragmentBytes:&eyeOverride length:sizeof(eyeOverride) atIndex:1];
             [renderCommandEncoder setFragmentBytes:&colorBoost length:sizeof(colorBoost) atIndex:2];
+            [renderCommandEncoder setFragmentBytes:&stabilityAmount length:sizeof(stabilityAmount) atIndex:3];
             _videoQuadMesh->draw(renderCommandEncoder, &poseConstants[i], 1);
 
             [renderCommandEncoder endEncoding];
@@ -480,11 +485,14 @@ void SpatialRenderer::drawAndPresent(cp_frame_t frame, cp_drawable_t drawable) {
         [renderCommandEncoder setRenderPipelineState:_contentRenderPipelineState];
         // In amplified mode each viewport gets per-eye sampling from one draw call.
         float separation = _disparityStrength / std::max(1.0f, (float)_videoQuadMesh->texture().width);
+        separation *= disparityStabilityScale;
         uint32_t eyeOverride = UINT32_MAX;
         float colorBoost = std::clamp((float)_configuration.colorBoost, 0.80f, 1.40f);
+        float stabilityAmount = std::clamp((float)_configuration.stabilityAmount, 0.0f, 1.0f);
         [renderCommandEncoder setFragmentBytes:&separation length:sizeof(separation) atIndex:0];
         [renderCommandEncoder setFragmentBytes:&eyeOverride length:sizeof(eyeOverride) atIndex:1];
         [renderCommandEncoder setFragmentBytes:&colorBoost length:sizeof(colorBoost) atIndex:2];
+        [renderCommandEncoder setFragmentBytes:&stabilityAmount length:sizeof(stabilityAmount) atIndex:3];
         _videoQuadMesh->draw(renderCommandEncoder, poseConstants.data(), viewCount);
 
         [renderCommandEncoder endEncoding];
@@ -579,17 +587,16 @@ void SpatialRenderer::requestDepthInference(CVPixelBufferRef pixelBuffer, CFTime
         return;
     }
 
-    // Optimization: Frame skip for static scenes. Skip every other frame by default.
-    // On high-motion scenes, skip fewer frames. Reduces ML inference load while maintaining temporal quality.
-    const int skipInterval = 2;  // Perform inference every N frames
+    // Keep depth inference cadence tighter to reduce pan-induced stereo shimmer.
+    const int skipInterval = 1;
     _frameSkipCounter++;
     if (_frameSkipCounter % skipInterval != 0) {
         return;  // Reuse previous depth, continue with temporal smoothing
     }
 
-    // Debounce: Avoid rapid-fire inference calls (minimum 33ms between inferences = ~30fps max)
+    // Allow up to ~45fps inference cadence for better temporal alignment with motion.
     CFTimeInterval timeSinceLastInference = frameTime - _lastInferenceTime;
-    if (timeSinceLastInference < 0.033) {
+    if (timeSinceLastInference < 0.022) {
         _frameSkipCounter--;  // Don't consume skip counter if we're debouncing
         return;
     }
@@ -637,10 +644,25 @@ void SpatialRenderer::uploadSmoothedDepthToTexture() {
     std::vector<float> resized((size_t)dstW * dstH, 0.5f);
 
     for (uint32_t y = 0; y < dstH; ++y) {
-        uint32_t sy = (srcH <= 1) ? 0 : (uint32_t)((float)y * (float)(srcH - 1) / (float)(dstH - 1));
+        float fy = (srcH <= 1 || dstH <= 1) ? 0.0f : ((float)y * (float)(srcH - 1) / (float)(dstH - 1));
+        uint32_t y0 = (uint32_t)std::floor(fy);
+        uint32_t y1 = std::min(y0 + 1, srcH - 1);
+        float ty = fy - (float)y0;
+
         for (uint32_t x = 0; x < dstW; ++x) {
-            uint32_t sx = (srcW <= 1) ? 0 : (uint32_t)((float)x * (float)(srcW - 1) / (float)(dstW - 1));
-            resized[(size_t)y * dstW + x] = depthCopy[(size_t)sy * srcW + sx];
+            float fx = (srcW <= 1 || dstW <= 1) ? 0.0f : ((float)x * (float)(srcW - 1) / (float)(dstW - 1));
+            uint32_t x0 = (uint32_t)std::floor(fx);
+            uint32_t x1 = std::min(x0 + 1, srcW - 1);
+            float tx = fx - (float)x0;
+
+            float d00 = depthCopy[(size_t)y0 * srcW + x0];
+            float d10 = depthCopy[(size_t)y0 * srcW + x1];
+            float d01 = depthCopy[(size_t)y1 * srcW + x0];
+            float d11 = depthCopy[(size_t)y1 * srcW + x1];
+
+            float top = d00 + (d10 - d00) * tx;
+            float bottom = d01 + (d11 - d01) * tx;
+            resized[(size_t)y * dstW + x] = top + (bottom - top) * ty;
         }
     }
 

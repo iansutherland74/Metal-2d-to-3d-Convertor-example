@@ -14,6 +14,7 @@ NS_ASSUME_NONNULL_BEGIN
 @property (assign) CGFloat panelOffsetZ;
 @property (assign) CGFloat panelScale;
 @property (assign) CGFloat disparityStrength;
+@property (assign) CGFloat stabilityAmount;
 @property (assign) CGFloat colorBoost;
 @property (strong, nullable) AVPlayerItemVideoOutput *videoOutput;
 @end

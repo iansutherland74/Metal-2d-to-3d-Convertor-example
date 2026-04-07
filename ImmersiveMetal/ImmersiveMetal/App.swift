@@ -31,7 +31,9 @@ struct FullyImmersiveMetalApp: App {
         WindowGroup {
             ConverterControlsView(rendererConfig, playbackController: playbackController)
                 .frame(minWidth: 520, minHeight: 520)
+                .glassBackgroundEffect(displayMode: .never)
         }
+        .windowStyle(.plain)
         .windowResizability(.automatic)
 
         ImmersiveSpace(id: "ImmersiveSpace") {

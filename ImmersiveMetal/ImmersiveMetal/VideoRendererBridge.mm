@@ -17,7 +17,8 @@
         _panelOffsetY = 0.0f;
         _panelOffsetZ = -1.0f;
         _panelScale = 1.0f;
-        _disparityStrength = 3.0f;
+        _disparityStrength = 6.5f;
+        _stabilityAmount = 0.35f;
         _colorBoost = 1.40f;
         _videoOutput = nil;
     }

@@ -6,6 +6,10 @@ final class VideoPlaybackController: ObservableObject {
     @Published var isPlaying = false
     @Published var currentTime = 0.0
     @Published var duration = 0.0
+    @Published var videoTitle = "Sample Video"
+    @Published var isMuted = false
+    @Published var subtitlesEnabled = false
+    @Published var hasSubtitles = false
 
     let player: AVPlayer
     let videoOutput: AVPlayerItemVideoOutput
@@ -33,6 +37,7 @@ final class VideoPlaybackController: ObservableObject {
             item.add(videoOutput)
             player = AVPlayer(playerItem: item)
             player.actionAtItemEnd = .none
+            configureMediaMetadata(item: item, url: videoURL)
             // Expose frame output to the native renderer.
             configuration.videoOutput = videoOutput
 
@@ -98,6 +103,17 @@ final class VideoPlaybackController: ObservableObject {
         seek(to: currentTime + delta)
     }
 
+    func toggleMute() {
+        player.isMuted.toggle()
+        isMuted = player.isMuted
+    }
+
+    func toggleSubtitles() {
+        // Subtitle track selection APIs are unavailable on current visionOS SDK.
+        subtitlesEnabled = false
+        hasSubtitles = false
+    }
+
     func seek(to requestedTime: Double) {
         let clamped = min(max(0.0, requestedTime), max(duration, 0.0))
         let seekTime = CMTimeMakeWithSeconds(clamped, preferredTimescale: 600)
@@ -121,7 +137,27 @@ final class VideoPlaybackController: ObservableObject {
         }
 
         isPlaying = player.rate != 0.0
+        isMuted = player.isMuted
+        refreshSubtitleState()
         // Keep renderer connected only when an item is active.
         configuration?.videoOutput = player.currentItem != nil ? videoOutput : nil
+    }
+
+    private func configureMediaMetadata(item: AVPlayerItem, url: URL) {
+        // Try embedded title metadata first, then fall back to file name.
+        let metadataTitle = item.asset.commonMetadata
+            .first(where: { $0.commonKey?.rawValue == "title" })?
+            .stringValue?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let fallback = url.deletingPathExtension().lastPathComponent
+            .replacingOccurrences(of: "_", with: " ")
+        videoTitle = (metadataTitle?.isEmpty == false) ? metadataTitle! : fallback
+        refreshSubtitleState()
+    }
+
+    private func refreshSubtitleState() {
+        hasSubtitles = false
+        subtitlesEnabled = false
     }
 }
