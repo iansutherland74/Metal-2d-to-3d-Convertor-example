@@ -19,28 +19,21 @@ private:
     simd_float4x4 _modelMatrix = matrix_identity_float4x4;
 };
 
-class TexturedMesh: public Mesh {
+class StereoQuadMesh: public Mesh {
 public:
-    TexturedMesh();
-    TexturedMesh(MDLMesh *mdlMesh, NSString *imageName, id<MTLDevice> device);
+    StereoQuadMesh(float width, float height, NSString *imageName, id<MTLDevice> device);
 
+    MTLVertexDescriptor *vertexDescriptor() const override;
     void draw(id<MTLRenderCommandEncoder> renderCommandEncoder, PoseConstants *poseConstants, size_t poseCount) override;
 
-protected:
-    MTKMesh *_mesh;
-    id<MTLTexture> _texture;
-};
-
-class SpatialEnvironmentMesh: public TexturedMesh {
-public:
-    SpatialEnvironmentMesh(NSString *imageName, CGFloat radius, id<MTLDevice> device);
-    void draw(id<MTLRenderCommandEncoder> renderCommandEncoder, PoseConstants *poseConstants, size_t poseCount) override;
-
-    float cutoffAngle() const;
-    void setCutoffAngle(float cutoffAngle);
+    id<MTLTexture> texture() const { return _colorTexture; }
+    void setColorTexture(id<MTLTexture> texture) { if (texture != nil) { _colorTexture = texture; } }
+    void setDepthTexture(id<MTLTexture> texture) { _depthTexture = texture; }
 
 private:
-    simd_float4x4 _environmentRotation;
-    float _cutoffAngle = 180.0f;
-    float _cutoffEdgeWidth = 0.125f;
+    id<MTLBuffer> _vertexBuffer;
+    id<MTLBuffer> _indexBuffer;
+    NSUInteger _indexCount;
+    id<MTLTexture> _colorTexture;
+    id<MTLTexture> _depthTexture;
 };

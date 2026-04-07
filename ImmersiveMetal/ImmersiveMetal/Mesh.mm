@@ -1,7 +1,7 @@
 
 #include "Mesh.h"
 
-#import <ModelIO/ModelIO.h>
+#include <array>
 
 static id<MTLTexture> _Nullable CreateTextureFromImage(NSString *imageName, id<MTLDevice> device, NSError **error) {
     MTKTextureLoader *textureLoader = [[MTKTextureLoader alloc] initWithDevice:device];
@@ -34,114 +34,58 @@ MTLVertexDescriptor *Mesh::vertexDescriptor() const {
     return vertexDescriptor;
 }
 
-TexturedMesh::TexturedMesh() = default;
+struct StereoQuadVertex {
+    simd_float4 position;
+    simd_float2 texCoord;
+};
 
-TexturedMesh::TexturedMesh(MDLMesh *mdlMesh, NSString *imageName, id<MTLDevice> device) {
+StereoQuadMesh::StereoQuadMesh(float width, float height, NSString *imageName, id<MTLDevice> device) {
     NSError *error = nil;
+    _colorTexture = CreateTextureFromImage(imageName, device, &error);
 
-    _texture = CreateTextureFromImage(imageName, device, &error);
+    const float halfWidth = width * 0.5f;
+    const float halfHeight = height * 0.5f;
+    std::array<StereoQuadVertex, 4> vertices = {{
+        { simd_make_float4(-halfWidth,  halfHeight, 0.0f, 1.0f), simd_make_float2(0.0f, 0.0f) },
+        { simd_make_float4(-halfWidth, -halfHeight, 0.0f, 1.0f), simd_make_float2(0.0f, 1.0f) },
+        { simd_make_float4( halfWidth, -halfHeight, 0.0f, 1.0f), simd_make_float2(1.0f, 1.0f) },
+        { simd_make_float4( halfWidth,  halfHeight, 0.0f, 1.0f), simd_make_float2(1.0f, 0.0f) }
+    }};
+    std::array<uint16_t, 6> indices = {{0, 1, 2, 0, 2, 3}};
 
-    MDLVertexDescriptor *mdlVertexDescriptor = [MDLVertexDescriptor new];
-    mdlVertexDescriptor.attributes[0].name = MDLVertexAttributePosition;
-    mdlVertexDescriptor.attributes[0].format = MDLVertexFormatFloat3;
-    mdlVertexDescriptor.attributes[0].bufferIndex = 0;
-    mdlVertexDescriptor.attributes[0].offset = 0;
-    mdlVertexDescriptor.attributes[1].name = MDLVertexAttributeNormal;
-    mdlVertexDescriptor.attributes[1].format = MDLVertexFormatFloat3;
-    mdlVertexDescriptor.attributes[1].bufferIndex = 0;
-    mdlVertexDescriptor.attributes[1].offset = sizeof(float) * 3;
-    mdlVertexDescriptor.attributes[2].name = MDLVertexAttributeTextureCoordinate;
-    mdlVertexDescriptor.attributes[2].format = MDLVertexFormatFloat2;
-    mdlVertexDescriptor.attributes[2].bufferIndex = 0;
-    mdlVertexDescriptor.attributes[2].offset = sizeof(float) * 6;
-    mdlVertexDescriptor.layouts[0].stride = sizeof(float) * 8;
-    
-    mdlMesh.vertexDescriptor = mdlVertexDescriptor;
-    
-    _mesh = [[MTKMesh alloc] initWithMesh:mdlMesh device:device error:&error];
+    _vertexBuffer = [device newBufferWithBytes:vertices.data()
+                                        length:vertices.size() * sizeof(StereoQuadVertex)
+                                       options:MTLResourceStorageModeShared];
+    _indexBuffer = [device newBufferWithBytes:indices.data()
+                                       length:indices.size() * sizeof(uint16_t)
+                                      options:MTLResourceStorageModeShared];
+    _indexCount = indices.size();
 }
 
-void TexturedMesh::draw(id<MTLRenderCommandEncoder> renderCommandEncoder, PoseConstants *poseConstants, size_t poseCount) {
+MTLVertexDescriptor *StereoQuadMesh::vertexDescriptor() const {
+    MTLVertexDescriptor *vertexDescriptor = [MTLVertexDescriptor new];
+    vertexDescriptor.attributes[0].format = MTLVertexFormatFloat4;
+    vertexDescriptor.attributes[0].bufferIndex = 0;
+    vertexDescriptor.attributes[0].offset = 0;
+    vertexDescriptor.attributes[1].format = MTLVertexFormatFloat2;
+    vertexDescriptor.attributes[1].bufferIndex = 0;
+    vertexDescriptor.attributes[1].offset = sizeof(float) * 4;
+    vertexDescriptor.layouts[0].stride = sizeof(StereoQuadVertex);
+    return vertexDescriptor;
+}
+
+void StereoQuadMesh::draw(id<MTLRenderCommandEncoder> renderCommandEncoder, PoseConstants *poseConstants, size_t poseCount) {
     InstanceConstants instanceConstants;
     instanceConstants.modelMatrix = modelMatrix();
 
-    MTKSubmesh *submesh = _mesh.submeshes.firstObject;
-    MTKMeshBuffer *vertexBuffer = _mesh.vertexBuffers.firstObject;
-    [renderCommandEncoder setVertexBuffer:vertexBuffer.buffer offset:vertexBuffer.offset atIndex:0];
+    [renderCommandEncoder setVertexBuffer:_vertexBuffer offset:0 atIndex:0];
     [renderCommandEncoder setVertexBytes:poseConstants length:sizeof(PoseConstants) * poseCount atIndex:1];
     [renderCommandEncoder setVertexBytes:&instanceConstants length:sizeof(instanceConstants) atIndex:2];
-    [renderCommandEncoder setFragmentTexture:_texture atIndex:0];
+    [renderCommandEncoder setFragmentTexture:_colorTexture atIndex:0];
+    [renderCommandEncoder setFragmentTexture:(_depthTexture != nil ? _depthTexture : _colorTexture) atIndex:1];
     [renderCommandEncoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
-                                     indexCount:submesh.indexCount
-                                      indexType:submesh.indexType
-                                    indexBuffer:submesh.indexBuffer.buffer
-                              indexBufferOffset:submesh.indexBuffer.offset];
-}
-
-SpatialEnvironmentMesh::SpatialEnvironmentMesh(NSString *imageName, CGFloat radius, id<MTLDevice> device) :
-    TexturedMesh()
-{
-    NSError *error = nil;
-    _texture = CreateTextureFromImage(imageName, device, &error);
-
-    _environmentRotation = matrix_identity_float4x4;
-
-    MTKMeshBufferAllocator *bufferAllocator = [[MTKMeshBufferAllocator alloc] initWithDevice:device];
-    MDLMesh *mdlMesh = [MDLMesh newEllipsoidWithRadii:simd_make_float3(radius, radius, radius)
-                                       radialSegments:24
-                                     verticalSegments:24
-                                         geometryType:MDLGeometryTypeTriangles
-                                        inwardNormals:YES
-                                           hemisphere:NO
-                                            allocator:bufferAllocator];
-
-    MDLVertexDescriptor *mdlVertexDescriptor = [MDLVertexDescriptor new];
-    mdlVertexDescriptor.attributes[0].name = MDLVertexAttributePosition;
-    mdlVertexDescriptor.attributes[0].format = MDLVertexFormatFloat3;
-    mdlVertexDescriptor.attributes[0].bufferIndex = 0;
-    mdlVertexDescriptor.attributes[0].offset = 0;
-    mdlVertexDescriptor.attributes[1].name = MDLVertexAttributeNormal;
-    mdlVertexDescriptor.attributes[1].format = MDLVertexFormatFloat3;
-    mdlVertexDescriptor.attributes[1].bufferIndex = 0;
-    mdlVertexDescriptor.attributes[1].offset = sizeof(float) * 3;
-    mdlVertexDescriptor.attributes[2].name = MDLVertexAttributeTextureCoordinate;
-    mdlVertexDescriptor.attributes[2].format = MDLVertexFormatFloat2;
-    mdlVertexDescriptor.attributes[2].bufferIndex = 0;
-    mdlVertexDescriptor.attributes[2].offset = sizeof(float) * 6;
-    mdlVertexDescriptor.layouts[0].stride = sizeof(float) * 8;
-
-    mdlMesh.vertexDescriptor = mdlVertexDescriptor;
-
-    _mesh = [[MTKMesh alloc] initWithMesh:mdlMesh device:device error:&error];
-}
-
-float SpatialEnvironmentMesh::cutoffAngle() const {
-    return _cutoffAngle;
-}
-
-void SpatialEnvironmentMesh::setCutoffAngle(float cutoffAngle) {
-    _cutoffAngle = cutoffAngle;
-}
-
-void SpatialEnvironmentMesh::draw(id<MTLRenderCommandEncoder> renderCommandEncoder, PoseConstants *poseConstants, size_t poseCount) {
-    float cutoffAngleMin = cos(simd_clamp(_cutoffAngle - _cutoffEdgeWidth, 0.0f, 180.0f) * (M_PI / 180.0f));
-    float cutoffAngleMax = cos(simd_clamp(_cutoffAngle + _cutoffEdgeWidth, 0.0f, 180.0f) * (M_PI / 180.0f));
-
-    EnvironmentConstants environmentConstants;
-    environmentConstants.modelMatrix = modelMatrix();
-    environmentConstants.environmentRotation = matrix_identity_float4x4;
-    environmentConstants.portalCutoffAngles = simd_make_float2(cutoffAngleMin, cutoffAngleMax);
-
-    MTKSubmesh *submesh = _mesh.submeshes.firstObject;
-    MTKMeshBuffer *vertexBuffer = _mesh.vertexBuffers.firstObject;
-    [renderCommandEncoder setVertexBuffer:vertexBuffer.buffer offset:vertexBuffer.offset atIndex:0];
-    [renderCommandEncoder setVertexBytes:poseConstants length:sizeof(PoseConstants) * poseCount atIndex:1];
-    [renderCommandEncoder setVertexBytes:&environmentConstants length:sizeof(environmentConstants) atIndex:2];
-    [renderCommandEncoder setFragmentBytes:&environmentConstants length:sizeof(environmentConstants) atIndex:0];
-    [renderCommandEncoder setFragmentTexture:_texture atIndex:0];
-    [renderCommandEncoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
-                                     indexCount:submesh.indexCount
-                                      indexType:submesh.indexType
-                                    indexBuffer:submesh.indexBuffer.buffer
-                              indexBufferOffset:submesh.indexBuffer.offset];
+                                     indexCount:_indexCount
+                                      indexType:MTLIndexTypeUInt16
+                                    indexBuffer:_indexBuffer
+                              indexBufferOffset:0];
 }

@@ -1,1 +1,5 @@
 xcuserdata/
+.DS_Store
+ImmersiveMetal/build/
+ImmersiveMetal/build-device/
+*.mp4

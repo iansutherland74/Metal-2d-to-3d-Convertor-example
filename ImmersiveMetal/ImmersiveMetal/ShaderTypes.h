@@ -10,9 +10,3 @@ struct PoseConstants {
 struct InstanceConstants {
     simd_float4x4 modelMatrix;
 };
-
-struct EnvironmentConstants {
-    simd_float4x4 modelMatrix;
-    simd_float4x4 environmentRotation;
-    simd_float2 portalCutoffAngles; // x = cos(innerCutoffAngle); y = cos(outerCutoffAngle)
-};

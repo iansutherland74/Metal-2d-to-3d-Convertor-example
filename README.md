@@ -1,9 +1,23 @@
-# Immersive Spatial Rendering with Metal in visionOS
+# 2D to 3D Video Converter for Apple Vision Pro
 
-This sample is a minimal example of rendering a immersive spatial experience with Metal, ARKit, and visionOS Compositing Services.
+This project is a streamlined visionOS app focused on one task: converting monoscopic 2D video into stereo 3D playback in an ImmersiveSpace using Metal and CompositorServices.
 
-![Example screenshot of spatial rendering](screenshots/01.png)
+## What it does
 
-When running on the Simulator, the app uses the [`.dedicated`](https://developer.apple.com/documentation/compositorservices/layerrenderer/layout/dedicated) layout. When running on an Apple Vision Pro, the app uses the [`.layered`](https://developer.apple.com/documentation/compositorservices/layerrenderer/layout/layered) layout along with [Metal vertex amplification](https://developer.apple.com/documentation/metal/render_passes/improving_rendering_performance_with_vertex_amplification) to efficiently render both stereo views in a single pass.
+- Plays a source 2D video through `AVPlayerItemVideoOutput`.
+- Generates a depth map per frame using a bundled Core ML depth model.
+- Falls back to a luminance-based depth estimate if model depth is unavailable.
+- Converts each frame to stereo by applying per-eye depth-based parallax in a Metal fragment shader.
 
-When running on a visionOS 2 simulator or device, the app enables the [mixed immersion style](https://developer.apple.com/documentation/swiftui/immersionstyle/mixed) and enables the user to progressively select how much of the real world is visible via passthrough.
+## Current focus
+
+This repository has been reduced from the original spatial rendering sample to keep only the conversion pipeline needed for 2D-to-3D video playback:
+
+- Kept: video decode, depth inference/fallback, stereo conversion shader, and immersive render loop.
+- Removed: environment sphere rendering, portal/passthrough controls, and hand-gesture interaction plumbing.
+
+## Rendering behavior
+
+- On Apple Vision Pro, the compositor uses layered rendering where available.
+- On the Simulator, the app can use dedicated layout.
+- Stereo views are rendered in a single pass when the runtime supports vertex amplification.
