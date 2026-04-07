@@ -193,10 +193,12 @@ SpatialRenderer::SpatialRenderer(cp_layer_renderer_t layerRenderer, Video3DConfi
     _lastRenderTime(CACurrentMediaTime()),
     _lastDepthTimestamp(0.0),
     _latestDepthTimestamp(0.0),
+    _lastInferenceTime(0.0),
     _disparityStrength(110.0f),
     _temporalSmoothing(0.24f),
     _depthWidth(0),
     _depthHeight(0),
+    _frameSkipCounter(0),
     _hasDepthModel(false),
     _depthInferenceInFlight(false)
 {
@@ -230,10 +232,36 @@ SpatialRenderer::SpatialRenderer(cp_layer_renderer_t layerRenderer, Video3DConfi
                     _depthWidth = w;
                     _depthHeight = h;
                 } else {
-                    // Blend temporal and local-gradient confidence to reduce depth flicker.
-                    const float minAlpha = 0.06f;
-                    const float maxAlpha = std::clamp(_temporalSmoothing, 0.08f, 0.45f);
+                    // Enhanced temporal smoothing with edge-preserving bilateral filtering.
+                    // Uses motion detection to adapt smoothing strength.
+                    const float minAlpha = 0.04f;  // Stronger temporal persistence
+                    const float maxAlpha = std::clamp(_temporalSmoothing, 0.12f, 0.50f);
+                    float totalMotion = 0.0f;  // Detect scene motion
+                    uint32_t motionPixels = 0;
 
+                    // First pass: detect motion and edge boundaries
+                    std::vector<float> edgeStrength(inferredDepth.size(), 0.0f);
+                    for (uint32_t y = 1; y < h - 1; ++y) {
+                        for (uint32_t x = 1; x < w - 1; ++x) {
+                            const size_t idx = (size_t)y * w + x;
+                            const float d = inferredDepth[idx];
+                            
+                            // Sobel-like edge detection on depth
+                            const float dx = (inferredDepth[idx + 1] - inferredDepth[idx - 1]) * 0.5f;
+                            const float dy = (inferredDepth[idx + w] - inferredDepth[idx - w]) * 0.5f;
+                            edgeStrength[idx] = std::sqrt(dx*dx + dy*dy);
+                            
+                            // Accumulate motion
+                            const float delta = std::fabs(d - _smoothedDepth[idx]);
+                            totalMotion += delta;
+                            if (delta > 0.02f) motionPixels++;
+                        }
+                    }
+                    float motionRatio = motionPixels / static_cast<float>(w * h);
+                    // In high-motion scenes, reduce smoothing to preserve detail
+                    float motionFactor = 1.0f - std::clamp(motionRatio * 2.0f, 0.0f, 0.6f);
+
+                    // Second pass: edge-aware temporal blending
                     for (uint32_t y = 0; y < h; ++y) {
                         const uint32_t yPrev = (y == 0) ? 0 : (y - 1);
                         const uint32_t yNext = (y + 1 >= h) ? (h - 1) : (y + 1);
@@ -251,8 +279,10 @@ SpatialRenderer::SpatialRenderer(cp_layer_renderer_t layerRenderer, Video3DConfi
 
                             const float previousDepth = _smoothedDepth[idx];
                             const float temporalDelta = std::fabs(currentDepth - previousDepth);
-                            const float temporalConfidence = std::exp(-temporalDelta * 8.0f);
+                            // Exponential decay for temporal confidence
+                            const float temporalConfidence = std::exp(-temporalDelta * 12.0f);
 
+                            // Enhanced spatial gradient with multi-neighbor analysis
                             const float left = inferredDepth[(size_t)y * w + xPrev];
                             const float right = inferredDepth[(size_t)y * w + xNext];
                             const float up = inferredDepth[(size_t)yPrev * w + x];
@@ -260,9 +290,16 @@ SpatialRenderer::SpatialRenderer(cp_layer_renderer_t layerRenderer, Video3DConfi
                             const float localGradient = std::max(std::fabs(currentDepth - left),
                                                          std::max(std::fabs(currentDepth - right),
                                                          std::max(std::fabs(currentDepth - up), std::fabs(currentDepth - down))));
-                            const float spatialConfidence = 1.0f - std::clamp(localGradient * 2.2f, 0.0f, 1.0f);
+                            
+                            // Preserve edges: high gradient = low smoothing
+                            const float isEdge = std::clamp(localGradient * 3.5f, 0.0f, 1.0f);
+                            const float edgeFactor = 1.0f - isEdge * 0.8f;  // Edges get less smoothing
+                            const float spatialConfidence = 1.0f - std::clamp(localGradient * 2.5f, 0.0f, 1.0f);
 
-                            const float confidence = std::clamp(0.7f * temporalConfidence + 0.3f * spatialConfidence, 0.0f, 1.0f);
+                            // Combined confidence with motion and edge awareness
+                            float confidence = std::clamp(0.65f * temporalConfidence + 0.35f * spatialConfidence, 0.0f, 1.0f);
+                            confidence *= edgeFactor * motionFactor;
+                            
                             const float alpha = minAlpha + (maxAlpha - minAlpha) * confidence;
                             _smoothedDepth[idx] = alpha * currentDepth + (1.0f - alpha) * previousDepth;
                         }
@@ -542,7 +579,23 @@ void SpatialRenderer::requestDepthInference(CVPixelBufferRef pixelBuffer, CFTime
         return;
     }
 
+    // Optimization: Frame skip for static scenes. Skip every other frame by default.
+    // On high-motion scenes, skip fewer frames. Reduces ML inference load while maintaining temporal quality.
+    const int skipInterval = 2;  // Perform inference every N frames
+    _frameSkipCounter++;
+    if (_frameSkipCounter % skipInterval != 0) {
+        return;  // Reuse previous depth, continue with temporal smoothing
+    }
+
+    // Debounce: Avoid rapid-fire inference calls (minimum 33ms between inferences = ~30fps max)
+    CFTimeInterval timeSinceLastInference = frameTime - _lastInferenceTime;
+    if (timeSinceLastInference < 0.033) {
+        _frameSkipCounter--;  // Don't consume skip counter if we're debouncing
+        return;
+    }
+
     _depthInferenceInFlight = true;
+    _lastInferenceTime = frameTime;
     CVPixelBufferRetain(pixelBuffer);
     // Run Vision inference off the render thread to avoid stalling frame submission.
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{

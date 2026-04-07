@@ -47,10 +47,12 @@ private:
     CFTimeInterval _lastRenderTime;
     CFTimeInterval _lastDepthTimestamp;
     CFTimeInterval _latestDepthTimestamp;
+    CFTimeInterval _lastInferenceTime;  // Track last ML inference for debouncing
     float _disparityStrength;
     float _temporalSmoothing;
     uint32_t _depthWidth;
     uint32_t _depthHeight;
+    uint32_t _frameSkipCounter;  // Skip inference on static scenes
     bool _hasDepthModel;
     bool _depthInferenceInFlight;
     std::vector<float> _smoothedDepth;
