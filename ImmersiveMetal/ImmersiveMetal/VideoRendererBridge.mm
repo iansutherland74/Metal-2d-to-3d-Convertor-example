@@ -21,6 +21,10 @@
         _stabilityAmount = 0.35f;
         _colorBoost = 1.40f;
         _videoOutput = nil;
+        _rendererDebugStatus = @"Renderer not started";
+        _renderedFrameCount = 0;
+        _receivedVideoFrameCount = 0;
+        _depthFrameCount = 0;
     }
     return self;
 }
@@ -30,9 +34,11 @@
 class Video3DRenderEngine {
 public:
     Video3DRenderEngine(cp_layer_renderer_t layerRenderer, Video3DConfiguration *configuration) :
-        _layerRenderer(layerRenderer)
+        _layerRenderer(layerRenderer),
+        _configuration(configuration)
     {
         _renderer = std::make_unique<SpatialRenderer>(layerRenderer, configuration);
+        _configuration.rendererDebugStatus = @"Renderer thread started";
         runWorldTrackingARSession();
     }
 
@@ -46,15 +52,20 @@ public:
                 switch (cp_layer_renderer_get_state(_layerRenderer)) {
                     case cp_layer_renderer_state_paused:
                         // Block until compositor indicates rendering should resume.
+                        _configuration.rendererDebugStatus = @"Compositor paused";
+                        NSLog(@"DepthPlayerRenderer: Compositor paused");
                         cp_layer_renderer_wait_until_running(_layerRenderer);
                         break;
                         
                     case cp_layer_renderer_state_running:
+                        _configuration.rendererDebugStatus = @"Compositor running";
                         renderFrame();
                         break;
                         
                         
                     case cp_layer_renderer_state_invalidated:
+                        _configuration.rendererDebugStatus = @"Compositor invalidated";
+                        NSLog(@"DepthPlayerRenderer: Compositor invalidated");
                         _running = false;
                         break;
                 }
@@ -86,6 +97,7 @@ public:
         cp_frame_start_submission(frame);
         cp_drawable_t drawable = cp_frame_query_drawable(frame);
         if (drawable == nullptr) {
+            cp_frame_end_submission(frame);
             return;
         }
 
@@ -125,6 +137,7 @@ private:
     ar_session_t _arSession;
     ar_world_tracking_provider_t _worldTrackingProvider;
     cp_layer_renderer_t _layerRenderer;
+    Video3DConfiguration *_configuration;
     std::unique_ptr<SpatialRenderer> _renderer;
     bool _running = true;
 };

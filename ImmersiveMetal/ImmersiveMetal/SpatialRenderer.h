@@ -6,6 +6,7 @@
 
 #include <memory>
 #include <mutex>
+#include <atomic>
 #include <vector>
 
 #import <CompositorServices/CompositorServices.h>
@@ -24,6 +25,7 @@ public:
 private:
     void makeResources();
     void makeRenderPipelines();
+    void ensureDepthMapTexture(size_t videoWidth, size_t videoHeight);
     void updateVideoFrame();
     void requestDepthInference(CVPixelBufferRef pixelBuffer, CFTimeInterval frameTime);
     void updateFallbackDepthFromLuma(id<MTLCommandBuffer> commandBuffer);
@@ -53,8 +55,17 @@ private:
     uint32_t _depthWidth;
     uint32_t _depthHeight;
     uint32_t _frameSkipCounter;  // Skip inference on static scenes
+    uint32_t _depthSkipInterval;
+    uint32_t _textureCacheFlushCounter;
+    uint64_t _latestDepthGeneration;
+    uint64_t _uploadedDepthGeneration;
     bool _hasDepthModel;
-    bool _depthInferenceInFlight;
+    bool _depthInferenceSuppressedByMemory;
+    bool _memoryPressureTightMode;
+    std::atomic_bool _depthInferenceInFlight;
+    dispatch_queue_t _depthInferenceQueue;
     std::vector<float> _smoothedDepth;
+    std::vector<float> _depthCopyBuffer;
+    std::vector<float> _depthResizeBuffer;
     std::mutex _depthMutex;
 };

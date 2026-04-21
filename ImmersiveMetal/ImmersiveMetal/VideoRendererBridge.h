@@ -17,6 +17,10 @@ NS_ASSUME_NONNULL_BEGIN
 @property (assign) CGFloat stabilityAmount;
 @property (assign) CGFloat colorBoost;
 @property (strong, nullable) AVPlayerItemVideoOutput *videoOutput;
+@property (copy) NSString *rendererDebugStatus;
+@property (assign) NSUInteger renderedFrameCount;
+@property (assign) NSUInteger receivedVideoFrameCount;
+@property (assign) NSUInteger depthFrameCount;
 @end
 
 #if __cplusplus

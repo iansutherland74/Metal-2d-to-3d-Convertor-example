@@ -17,6 +17,19 @@
 #include <cfloat>
 #include <cmath>
 
+#include <mach/mach.h>
+
+static void SetDebugStatus(Video3DConfiguration *configuration, NSString *status) {
+    if (configuration == nil || status == nil) {
+        return;
+    }
+    if ([configuration.rendererDebugStatus isEqualToString:status]) {
+        return;
+    }
+    configuration.rendererDebugStatus = status;
+    NSLog(@"DepthPlayerRenderer: %@", status);
+}
+
 static MTLPixelFormat metalPixelFormatForVideoPixelBuffer(CVPixelBufferRef pixelBuffer) {
     switch (CVPixelBufferGetPixelFormatType(pixelBuffer)) {
         case kCVPixelFormatType_64RGBAHalf:
@@ -26,6 +39,35 @@ static MTLPixelFormat metalPixelFormatForVideoPixelBuffer(CVPixelBufferRef pixel
         default:
             return MTLPixelFormatInvalid;
     }
+}
+
+static uint64_t CurrentPhysFootprintBytes() {
+    task_vm_info_data_t vmInfo;
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    kern_return_t kr = task_info(mach_task_self_, TASK_VM_INFO, (task_info_t)&vmInfo, &count);
+    if (kr != KERN_SUCCESS) {
+        return 0;
+    }
+    return vmInfo.phys_footprint;
+}
+
+static void LogRendererMemoryWatchdogIfNeeded(CFTimeInterval now, Video3DConfiguration *configuration) {
+    static CFTimeInterval lastLogTime = 0;
+    if (now - lastLogTime < 1.0) {
+        return;
+    }
+    lastLogTime = now;
+
+    uint64_t bytes = CurrentPhysFootprintBytes();
+    if (bytes == 0) {
+        return;
+    }
+    double mb = (double)bytes / (1024.0 * 1024.0);
+    NSLog(@"DepthPlayerMemoryWatchdog: phys_footprint=%.1fMB vf=%llu df=%llu status=%@",
+          mb,
+          (unsigned long long)configuration.receivedVideoFrameCount,
+          (unsigned long long)configuration.depthFrameCount,
+          configuration.rendererDebugStatus ?: @"n/a");
 }
 
 static simd_float4x4 matrix_float4x4_from_double4x4(simd_double4x4 m) {
@@ -100,12 +142,34 @@ static bool CopyDepthObservationToFloatBuffer(VNRequest *request,
 
         outDepth.resize((size_t)outWidth * outHeight);
 
+        const NSInteger widthIndex = multiArray.shape.count - 1;
+        const NSInteger heightIndex = multiArray.shape.count - 2;
+        const NSInteger widthStride = multiArray.strides[widthIndex].integerValue;
+        const NSInteger heightStride = multiArray.strides[heightIndex].integerValue;
+        const MLMultiArrayDataType dataType = multiArray.dataType;
+        const char *base = (const char *)multiArray.dataPointer;
+
+        auto readValueAtOffset = [&](NSInteger elementOffset) -> float {
+            switch (dataType) {
+                case MLMultiArrayDataTypeDouble:
+                    return (float)((const double *)base)[elementOffset];
+                case MLMultiArrayDataTypeFloat32:
+                    return ((const float *)base)[elementOffset];
+                case MLMultiArrayDataTypeFloat16:
+                    return (float)((const __fp16 *)base)[elementOffset];
+                case MLMultiArrayDataTypeInt32:
+                    return (float)((const int32_t *)base)[elementOffset];
+                default:
+                    return 0.5f;
+            }
+        };
+
         float minDepth = FLT_MAX;
         float maxDepth = -FLT_MAX;
         for (uint32_t y = 0; y < outHeight; ++y) {
             for (uint32_t x = 0; x < outWidth; ++x) {
-                NSArray<NSNumber *> *index = @[@0, @(y), @(x)];
-                float v = ((NSNumber *)[multiArray objectForKeyedSubscript:index]).floatValue;
+                const NSInteger offset = (NSInteger)y * heightStride + (NSInteger)x * widthStride;
+                float v = readValueAtOffset(offset);
                 minDepth = std::min(minDepth, v);
                 maxDepth = std::max(maxDepth, v);
                 outDepth[(size_t)y * outWidth + x] = v;
@@ -199,8 +263,15 @@ SpatialRenderer::SpatialRenderer(cp_layer_renderer_t layerRenderer, Video3DConfi
     _depthWidth(0),
     _depthHeight(0),
     _frameSkipCounter(0),
+    _depthSkipInterval(5),
+    _textureCacheFlushCounter(0),
+    _latestDepthGeneration(0),
+    _uploadedDepthGeneration(0),
     _hasDepthModel(false),
-    _depthInferenceInFlight(false)
+    _depthInferenceSuppressedByMemory(false),
+    _memoryPressureTightMode(false),
+    _depthInferenceInFlight(false),
+    _depthInferenceQueue(dispatch_queue_create("com.vision.depthplayer.depth-inference", DISPATCH_QUEUE_SERIAL))
 {
     _device = cp_layer_renderer_get_device(layerRenderer);
     _commandQueue = [_device newCommandQueue];
@@ -231,29 +302,22 @@ SpatialRenderer::SpatialRenderer(cp_layer_renderer_t layerRenderer, Video3DConfi
                     _smoothedDepth = inferredDepth;
                     _depthWidth = w;
                     _depthHeight = h;
+                    _latestDepthGeneration += 1;
                 } else {
                     // Enhanced temporal smoothing with edge-preserving bilateral filtering.
                     // Uses motion detection to adapt smoothing strength.
                     const float minAlpha = 0.04f;  // Stronger temporal persistence
                     const float maxAlpha = std::clamp(_temporalSmoothing, 0.12f, 0.50f);
-                    float totalMotion = 0.0f;  // Detect scene motion
                     uint32_t motionPixels = 0;
 
                     // First pass: detect motion and edge boundaries
-                    std::vector<float> edgeStrength(inferredDepth.size(), 0.0f);
                     for (uint32_t y = 1; y < h - 1; ++y) {
                         for (uint32_t x = 1; x < w - 1; ++x) {
                             const size_t idx = (size_t)y * w + x;
                             const float d = inferredDepth[idx];
-                            
-                            // Sobel-like edge detection on depth
-                            const float dx = (inferredDepth[idx + 1] - inferredDepth[idx - 1]) * 0.5f;
-                            const float dy = (inferredDepth[idx + w] - inferredDepth[idx - w]) * 0.5f;
-                            edgeStrength[idx] = std::sqrt(dx*dx + dy*dy);
-                            
+
                             // Accumulate motion
                             const float delta = std::fabs(d - _smoothedDepth[idx]);
-                            totalMotion += delta;
                             if (delta > 0.02f) motionPixels++;
                         }
                     }
@@ -304,6 +368,7 @@ SpatialRenderer::SpatialRenderer(cp_layer_renderer_t layerRenderer, Video3DConfi
                             _smoothedDepth[idx] = alpha * currentDepth + (1.0f - alpha) * previousDepth;
                         }
                     }
+                    _latestDepthGeneration += 1;
                 }
 
                 _depthInferenceInFlight = false;
@@ -323,17 +388,38 @@ SpatialRenderer::SpatialRenderer(cp_layer_renderer_t layerRenderer, Video3DConfi
 void SpatialRenderer::makeResources() {
     // Quad dimensions define the virtual screen where converted video is rendered.
     _videoQuadMesh = std::make_unique<StereoQuadMesh>(1.6f, 0.9f, @"bluemarble.png", _device);
+}
 
-    if (_videoQuadMesh->texture() != nil) {
-        MTLTextureDescriptor *depthDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float
-                                                                                            width:_videoQuadMesh->texture().width
-                                                                                           height:_videoQuadMesh->texture().height
-                                                                                        mipmapped:NO];
-        depthDesc.usage = MTLTextureUsageShaderRead;
-        depthDesc.storageMode = MTLStorageModeShared;
-        _depthMapTexture = [_device newTextureWithDescriptor:depthDesc];
-        _videoQuadMesh->setDepthTexture(_depthMapTexture);
+void SpatialRenderer::ensureDepthMapTexture(size_t videoWidth, size_t videoHeight) {
+    if (videoWidth == 0 || videoHeight == 0) {
+        return;
     }
+
+    static const size_t kMaxDepthDimension = 1024;
+    float scale = 1.0f;
+    const size_t longest = std::max(videoWidth, videoHeight);
+    if (longest > kMaxDepthDimension) {
+        scale = (float)kMaxDepthDimension / (float)longest;
+    }
+
+    const size_t targetWidth = std::max((size_t)1, (size_t)std::round((float)videoWidth * scale));
+    const size_t targetHeight = std::max((size_t)1, (size_t)std::round((float)videoHeight * scale));
+
+    if (_depthMapTexture != nil &&
+        _depthMapTexture.width == targetWidth &&
+        _depthMapTexture.height == targetHeight) {
+        return;
+    }
+
+    MTLTextureDescriptor *depthDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float
+                                                                                           width:targetWidth
+                                                                                          height:targetHeight
+                                                                                       mipmapped:NO];
+    depthDesc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    depthDesc.storageMode = MTLStorageModeShared;
+    _depthMapTexture = [_device newTextureWithDescriptor:depthDesc];
+    _uploadedDepthGeneration = 0;
+    _videoQuadMesh->setDepthTexture(_depthMapTexture);
 }
 
 void SpatialRenderer::makeRenderPipelines() {
@@ -391,9 +477,18 @@ void SpatialRenderer::makeRenderPipelines() {
 }
 
 void SpatialRenderer::drawAndPresent(cp_frame_t frame, cp_drawable_t drawable) {
+    @autoreleasepool {
+    if (_layerRenderer == nullptr || drawable == nullptr) {
+        return;
+    }
+
     CFTimeInterval renderTime = CACurrentMediaTime();
 
     cp_layer_renderer_configuration_t layerConfiguration = cp_layer_renderer_get_configuration(_layerRenderer);
+    if (layerConfiguration == nullptr) {
+        SetDebugStatus(_configuration, @"Renderer configuration unavailable");
+        return;
+    }
     cp_layer_renderer_layout layout = cp_layer_renderer_configuration_get_layout(layerConfiguration);
 
     ar_device_anchor_t deviceAnchor = cp_drawable_get_device_anchor(drawable);
@@ -424,18 +519,21 @@ void SpatialRenderer::drawAndPresent(cp_frame_t frame, cp_drawable_t drawable) {
         id<MTLCommandBuffer> fallbackCommandBuffer = [_commandQueue commandBuffer];
         updateFallbackDepthFromLuma(fallbackCommandBuffer);
         [fallbackCommandBuffer commit];
-        [fallbackCommandBuffer waitUntilCompleted];
     }
 
     uploadSmoothedDepthToTexture();
 
     id<MTLCommandBuffer> commandBuffer = [_commandQueue commandBuffer];
 
-    size_t viewCount = cp_drawable_get_view_count(drawable);
+    size_t drawableViewCount = cp_drawable_get_view_count(drawable);
+    if (drawableViewCount == 0) {
+        return;
+    }
+    size_t viewCount = std::min(drawableViewCount, static_cast<size_t>(2));
 
     std::array<MTLViewport, 2> viewports {};
     std::array<PoseConstants, 2> poseConstants {};
-    for (int i = 0; i < viewCount; ++i) {
+    for (size_t i = 0; i < viewCount; ++i) {
         viewports[i] = viewportForViewIndex(drawable, i);
 
         poseConstants[i] = poseConstantsForViewIndex(drawable, i);
@@ -444,9 +542,16 @@ void SpatialRenderer::drawAndPresent(cp_frame_t frame, cp_drawable_t drawable) {
     if (layout == cp_layer_renderer_layout_dedicated) {
         // When rendering with a "dedicated" layout, we draw each eye's view to a separate texture.
         // Since we can't switch render targets within a pass, we render one pass per view.
-        for (int i = 0; i < viewCount; ++i) {
+        for (size_t i = 0; i < viewCount; ++i) {
             MTLRenderPassDescriptor *renderPassDescriptor = createRenderPassDescriptor(drawable, i);
+            if (renderPassDescriptor == nil) {
+                SetDebugStatus(_configuration, @"Render pass unavailable (dedicated)");
+                continue;
+            }
             id<MTLRenderCommandEncoder> renderCommandEncoder = [commandBuffer renderCommandEncoderWithDescriptor:renderPassDescriptor];
+            if (renderCommandEncoder == nil) {
+                continue;
+            }
 
             [renderCommandEncoder setCullMode:MTLCullModeBack];
 
@@ -473,7 +578,14 @@ void SpatialRenderer::drawAndPresent(cp_frame_t frame, cp_drawable_t drawable) {
         // each view to a distinct region of a single render target, while the "layered" layout writes
         // each view to a separate slice of the render target array texture.
         MTLRenderPassDescriptor *renderPassDescriptor = createRenderPassDescriptor(drawable, 0);
+        if (renderPassDescriptor == nil) {
+            SetDebugStatus(_configuration, @"Render pass unavailable (shared/layered)");
+            return;
+        }
         id<MTLRenderCommandEncoder> renderCommandEncoder = [commandBuffer renderCommandEncoderWithDescriptor:renderPassDescriptor];
+        if (renderCommandEncoder == nil) {
+            return;
+        }
 
         [renderCommandEncoder setViewports:viewports.data() count:viewCount];
         [renderCommandEncoder setVertexAmplificationCount:viewCount viewMappings:nil];
@@ -501,24 +613,47 @@ void SpatialRenderer::drawAndPresent(cp_frame_t frame, cp_drawable_t drawable) {
     cp_drawable_encode_present(drawable, commandBuffer);
 
     [commandBuffer commit];
+    // Keep per-frame video textures transient; command buffer retains resources it needs.
+    _videoTexture = nil;
+    _configuration.renderedFrameCount += 1;
+    if (_configuration.renderedFrameCount == 1) {
+        SetDebugStatus(_configuration, @"Rendering active");
+    }
     _lastRenderTime = renderTime;
+    }
 }
 
 void SpatialRenderer::updateVideoFrame() {
+    CFTimeInterval hostTime = CACurrentMediaTime();
+    LogRendererMemoryWatchdogIfNeeded(hostTime, _configuration);
+
     AVPlayerItemVideoOutput *videoOutput = _configuration.videoOutput;
     if (videoOutput == nil || _videoTextureCache == nullptr) {
+        SetDebugStatus(_configuration, @"Waiting for AVPlayer video output");
         return;
     }
 
-    CMTime hostTime = CMClockGetTime(CMClockGetHostTimeClock());
-    CMTime itemTime = [videoOutput itemTimeForHostTime:CMTimeGetSeconds(hostTime)];
+    CMTime itemTime = [videoOutput itemTimeForHostTime:hostTime];
     _latestDepthTimestamp = CMTimeGetSeconds(itemTime);
-    if (![videoOutput hasNewPixelBufferForItemTime:itemTime]) {
-        return;
+
+    CVPixelBufferRef pixelBuffer = nullptr;
+    if ([videoOutput hasNewPixelBufferForItemTime:itemTime]) {
+        pixelBuffer = [videoOutput copyPixelBufferForItemTime:itemTime itemTimeForDisplay:nil];
+    }
+    if (pixelBuffer == nil && CMTIME_IS_VALID(itemTime)) {
+        // Retry against a slightly older host time to recover from timing jitter.
+        CMTime retryItemTime = [videoOutput itemTimeForHostTime:hostTime - (1.0 / 120.0)];
+        if ([videoOutput hasNewPixelBufferForItemTime:retryItemTime]) {
+            pixelBuffer = [videoOutput copyPixelBufferForItemTime:retryItemTime itemTimeForDisplay:nil];
+        }
+        if (pixelBuffer != nil) {
+            itemTime = retryItemTime;
+            _latestDepthTimestamp = CMTimeGetSeconds(itemTime);
+        }
     }
 
-    CVPixelBufferRef pixelBuffer = [videoOutput copyPixelBufferForItemTime:itemTime itemTimeForDisplay:nil];
     if (pixelBuffer == nil) {
+        SetDebugStatus(_configuration, @"Renderer active: no video frame available");
         return;
     }
 
@@ -527,30 +662,72 @@ void SpatialRenderer::updateVideoFrame() {
     MTLPixelFormat videoPixelFormat = metalPixelFormatForVideoPixelBuffer(pixelBuffer);
 
     if (videoPixelFormat == MTLPixelFormatInvalid) {
+        SetDebugStatus(_configuration, @"Unsupported pixel format from AVPlayer output");
         CVPixelBufferRelease(pixelBuffer);
         return;
     }
 
     CVMetalTextureRef metalTextureRef = nullptr;
-    CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault,
-                                              _videoTextureCache,
-                                              pixelBuffer,
-                                              nil,
-                                              videoPixelFormat,
-                                              width,
-                                              height,
-                                              0,
-                                              &metalTextureRef);
+    CVReturn textureStatus = CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault,
+                                                                       _videoTextureCache,
+                                                                       pixelBuffer,
+                                                                       nil,
+                                                                       videoPixelFormat,
+                                                                       width,
+                                                                       height,
+                                                                       0,
+                                                                       &metalTextureRef);
+    if (textureStatus != kCVReturnSuccess) {
+        SetDebugStatus(_configuration, [NSString stringWithFormat:@"CVMetalTexture creation failed: %d", textureStatus]);
+        CVMetalTextureCacheFlush(_videoTextureCache, 0);
+        CVPixelBufferRelease(pixelBuffer);
+        return;
+    }
     if (metalTextureRef != nullptr) {
         _videoTexture = CVMetalTextureGetTexture(metalTextureRef);
         if (_videoTexture != nil) {
+            ensureDepthMapTexture(width, height);
             _videoQuadMesh->setColorTexture(_videoTexture);
+            _configuration.receivedVideoFrameCount += 1;
         }
         CFRelease(metalTextureRef);
     }
 
+    const uint64_t softPressureBytes = 3800ull * 1024ull * 1024ull;  // Very high: only degrade depth near jetsam
+    const uint64_t hardPressureBytes = 4500ull * 1024ull * 1024ull;  // Emergency: suppress depth entirely if over 4.5GB
+    const uint64_t resumeBytes = 3500ull * 1024ull * 1024ull;  // Hysteresis: recover at 3.5GB
+    const uint64_t footprintBytes = CurrentPhysFootprintBytes();
+
+    // Ultra-smooth pressure tiers: run full depth quality until critically close to jetsam.
+    // Goal: smooth playback by keeping depth at full cadence for 95% of runtime, degrade only when necessary.
+    if (footprintBytes >= hardPressureBytes) {
+        // Emergency: suppress depth entirely only if critically close to jetsam (4.5GB+, rare).
+        _depthInferenceSuppressedByMemory = true;
+        _memoryPressureTightMode = true;
+        _depthSkipInterval = 30;
+    } else if (footprintBytes >= softPressureBytes) {
+        // Soft pressure: skip depth every 20 frames (very gentle, nearly full quality).
+        _depthInferenceSuppressedByMemory = false;
+        _memoryPressureTightMode = true;
+        _depthSkipInterval = 20;
+    } else if (footprintBytes <= resumeBytes) {
+        // Normal mode: full depth inference, every frame.
+        _depthInferenceSuppressedByMemory = false;
+        _memoryPressureTightMode = false;
+        _depthSkipInterval = 5;
+    }
+    // If between softPressure and hardPressure, maintain previous state (hysteresis, no oscillation)
+
     requestDepthInference(pixelBuffer, CMTimeGetSeconds(itemTime));
     CVPixelBufferRelease(pixelBuffer);
+
+    // Adapt cache flushing cadence to memory pressure to reduce wrapper buildup.
+    // Avoid flushing every frame even in tight mode, as it can cause GPU stalls.
+    _textureCacheFlushCounter += 1;
+    const uint32_t flushInterval = _memoryPressureTightMode ? 5u : 10u;
+    if ((_textureCacheFlushCounter % flushInterval) == 0) {
+        CVMetalTextureCacheFlush(_videoTextureCache, 0);
+    }
 }
 
 void SpatialRenderer::updateFallbackDepthFromLuma(id<MTLCommandBuffer> commandBuffer) {
@@ -583,39 +760,49 @@ void SpatialRenderer::updateFallbackDepthFromLuma(id<MTLCommandBuffer> commandBu
 }
 
 void SpatialRenderer::requestDepthInference(CVPixelBufferRef pixelBuffer, CFTimeInterval frameTime) {
-    if (_depthRequest == nil || _depthInferenceInFlight) {
+    if (_depthRequest == nil || _depthInferenceSuppressedByMemory) {
         return;
     }
 
-    // Keep depth inference cadence tighter to reduce pan-induced stereo shimmer.
-    const int skipInterval = 1;
+    bool expected = false;
+    if (!_depthInferenceInFlight.compare_exchange_strong(expected, true)) {
+        return;
+    }
+
+    const uint32_t skipInterval = std::max(1u, _depthSkipInterval);
     _frameSkipCounter++;
     if (_frameSkipCounter % skipInterval != 0) {
+        _depthInferenceInFlight = false;
         return;  // Reuse previous depth, continue with temporal smoothing
     }
 
-    // Allow up to ~45fps inference cadence for better temporal alignment with motion.
+    // Cap inference cadence to reduce pressure that can destabilize immersive rendering.
     CFTimeInterval timeSinceLastInference = frameTime - _lastInferenceTime;
-    if (timeSinceLastInference < 0.022) {
+        // Increased debounce from 66ms to 150ms (only infer every 150ms minimum)
+        if (timeSinceLastInference < 0.150) {
         _frameSkipCounter--;  // Don't consume skip counter if we're debouncing
+        _depthInferenceInFlight = false;
         return;
     }
 
-    _depthInferenceInFlight = true;
     _lastInferenceTime = frameTime;
+
     CVPixelBufferRetain(pixelBuffer);
-    // Run Vision inference off the render thread to avoid stalling frame submission.
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    dispatch_async(_depthInferenceQueue, ^{
         @autoreleasepool {
             NSError *error = nil;
             VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCVPixelBuffer:pixelBuffer options:@{}];
             [handler performRequests:@[_depthRequest] error:&error];
+
             if (error != nil) {
-                _depthInferenceInFlight = false;
+                SetDebugStatus(_configuration, [NSString stringWithFormat:@"Depth inference error: %@", error.localizedDescription]);
             } else {
                 _lastDepthTimestamp = frameTime;
+                _configuration.depthFrameCount += 1;
             }
+
             CVPixelBufferRelease(pixelBuffer);
+            _depthInferenceInFlight = false;
         }
     });
 }
@@ -625,15 +812,19 @@ void SpatialRenderer::uploadSmoothedDepthToTexture() {
         return;
     }
 
-    std::vector<float> depthCopy;
     uint32_t srcW = 0;
     uint32_t srcH = 0;
+    uint64_t latestDepthGeneration = 0;
     {
         std::lock_guard<std::mutex> lock(_depthMutex);
         if (_smoothedDepth.empty() || _depthWidth == 0 || _depthHeight == 0) {
             return;
         }
-        depthCopy = _smoothedDepth;
+        latestDepthGeneration = _latestDepthGeneration;
+        if (latestDepthGeneration != 0 && latestDepthGeneration == _uploadedDepthGeneration) {
+            return;
+        }
+        _depthCopyBuffer = _smoothedDepth;
         srcW = _depthWidth;
         srcH = _depthHeight;
     }
@@ -641,7 +832,11 @@ void SpatialRenderer::uploadSmoothedDepthToTexture() {
     const uint32_t dstW = static_cast<uint32_t>(_depthMapTexture.width);
     const uint32_t dstH = static_cast<uint32_t>(_depthMapTexture.height);
     // Resize model output to video resolution so shader sampling stays aligned with color pixels.
-    std::vector<float> resized((size_t)dstW * dstH, 0.5f);
+    const size_t dstSize = (size_t)dstW * dstH;
+    if (_depthResizeBuffer.size() != dstSize) {
+        _depthResizeBuffer.resize(dstSize);
+    }
+    std::fill(_depthResizeBuffer.begin(), _depthResizeBuffer.end(), 0.5f);
 
     for (uint32_t y = 0; y < dstH; ++y) {
         float fy = (srcH <= 1 || dstH <= 1) ? 0.0f : ((float)y * (float)(srcH - 1) / (float)(dstH - 1));
@@ -655,33 +850,47 @@ void SpatialRenderer::uploadSmoothedDepthToTexture() {
             uint32_t x1 = std::min(x0 + 1, srcW - 1);
             float tx = fx - (float)x0;
 
-            float d00 = depthCopy[(size_t)y0 * srcW + x0];
-            float d10 = depthCopy[(size_t)y0 * srcW + x1];
-            float d01 = depthCopy[(size_t)y1 * srcW + x0];
-            float d11 = depthCopy[(size_t)y1 * srcW + x1];
+            float d00 = _depthCopyBuffer[(size_t)y0 * srcW + x0];
+            float d10 = _depthCopyBuffer[(size_t)y0 * srcW + x1];
+            float d01 = _depthCopyBuffer[(size_t)y1 * srcW + x0];
+            float d11 = _depthCopyBuffer[(size_t)y1 * srcW + x1];
 
             float top = d00 + (d10 - d00) * tx;
             float bottom = d01 + (d11 - d01) * tx;
-            resized[(size_t)y * dstW + x] = top + (bottom - top) * ty;
+            _depthResizeBuffer[(size_t)y * dstW + x] = top + (bottom - top) * ty;
         }
     }
 
     MTLRegion region = MTLRegionMake2D(0, 0, dstW, dstH);
-    [_depthMapTexture replaceRegion:region mipmapLevel:0 withBytes:resized.data() bytesPerRow:dstW * sizeof(float)];
+    [_depthMapTexture replaceRegion:region mipmapLevel:0 withBytes:_depthResizeBuffer.data() bytesPerRow:dstW * sizeof(float)];
+    _uploadedDepthGeneration = latestDepthGeneration;
 }
 
 MTLRenderPassDescriptor* SpatialRenderer::createRenderPassDescriptor(cp_drawable_t drawable, size_t index) {
+    if (_layerRenderer == nullptr || drawable == nullptr) {
+        return nil;
+    }
+
     cp_layer_renderer_configuration_t layerConfiguration = cp_layer_renderer_get_configuration(_layerRenderer);
+    if (layerConfiguration == nullptr) {
+        return nil;
+    }
     cp_layer_renderer_layout layout = cp_layer_renderer_configuration_get_layout(layerConfiguration);
 
     MTLRenderPassDescriptor *passDescriptor = [[MTLRenderPassDescriptor alloc] init];
 
-    passDescriptor.colorAttachments[0].texture = cp_drawable_get_color_texture(drawable, index);
+    id<MTLTexture> colorTexture = cp_drawable_get_color_texture(drawable, index);
+    id<MTLTexture> depthTexture = cp_drawable_get_depth_texture(drawable, index);
+    if (colorTexture == nil || depthTexture == nil) {
+        return nil;
+    }
+
+    passDescriptor.colorAttachments[0].texture = colorTexture;
     passDescriptor.colorAttachments[0].loadAction = MTLLoadActionClear;
     passDescriptor.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
     passDescriptor.colorAttachments[0].storeAction = MTLStoreActionStore;
 
-    passDescriptor.depthAttachment.texture = cp_drawable_get_depth_texture(drawable, index);
+    passDescriptor.depthAttachment.texture = depthTexture;
     passDescriptor.depthAttachment.loadAction = MTLLoadActionClear;
     passDescriptor.depthAttachment.clearDepth = 0.0;
     passDescriptor.depthAttachment.storeAction = MTLStoreActionStore;
